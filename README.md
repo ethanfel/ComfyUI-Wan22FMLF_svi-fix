@@ -1,6 +1,11 @@
 # ComfyUI-Wan22FMLF_svi-fix
 
 ## 📝 更新日志 (svi-fix)
+### 2025-03-03 SVI advance节点完善
+
+将svi pro原版的anchor sample从start image中分离出来，便于锁定参考人物
+
+现在可直接通过关闭boost去实现原版svipro的功能
 
 ### 2025-02-01 SVI 新增节点
 
