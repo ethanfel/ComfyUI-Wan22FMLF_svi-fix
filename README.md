@@ -22,7 +22,7 @@ detail boost ：提高速度和细节，但是可能会让画面不稳定。 原
 
 正常搭配：仅增强svi原本效果
 
-`` motion influence 1-2 / overlap frames 4 / motion boost 1 / detail boost 0.5 ``
+`` motion influence 1-2 / overlap frames 4 / motion boost 1-1.5 / detail boost 1-1.5 ``
 
 极端搭配(开头或结尾会有4帧闪烁）：
 
