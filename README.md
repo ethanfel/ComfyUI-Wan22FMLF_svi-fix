@@ -1,4 +1,9 @@
-# ComfyUI-Wan22FMLF_svi-fix
+# ComfyUI-Wan22FMLF_svi-fix （svi boost）
+
+#### 四合一长视频工作流演示(上为对口型后的，下面为直出）
+
+https://github.com/user-attachments/assets/dc1cf2a4-3c6a-4210-a247-e53c2423f776
+
 
 #### 接口介绍：
 
