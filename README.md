@@ -22,13 +22,13 @@ fmlf： start image，middle image，end image 首尾中间帧优先级低于svi
 
 #### 参数介绍：
 
-motion influence ：用于控制传递下来的动态权重，如果太大或者太小都会让拼接不自然，默认1  （为了保持动态：低分辨率建议调高，高分辨率建议调低）
+· motion influence ：用于控制传递下来的动态权重，如果太大或者太小都会让拼接不自然，默认1  （为了保持动态：低分辨率建议调高，高分辨率建议调低）
 
-overlap frames : 提供给motion inluence的图像帧数量，内部会换算为latent帧处理（实际输入除4）
+· overlap frames : 提供给motion inluence的图像帧数量，内部会换算为latent帧处理（实际输入除4）
 
-motion boost ：提高动态，增加动作幅度。 `原理：计算连续帧之间的差异，放大运动向量`
+· motion boost ：提高动态，增加动作幅度。 `原理：计算连续帧之间的差异，放大运动向量`
 
-detail boost ：提高速度和细节，但是可能会让画面不稳定。 原理：在创建掩码和条件时，调整衰减率和使用的帧数
+· detail boost ：提高速度和细节，但是可能会让画面不稳定。 原理：在创建掩码和条件时，调整衰减率和使用的帧数
 
 ##### 正常搭配：仅增强svi原本效果
 
