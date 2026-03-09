@@ -36,7 +36,7 @@ https://github.com/user-attachments/assets/dc1cf2a4-3c6a-4210-a247-e53c2423f776
 
 `` motion influence 1-1.3 / overlap frames 4 / motion boost 1-1.5 / detail boost 1-1.5 ``
 
-###### 所有首尾帧的强度不要高于0.5!
+###### 所有首尾帧的强度不要高于0.5!会发灰！
 
 ##### 极端搭配：(开头或结尾会有4帧闪烁）（拼接处可能会不自然）
 
