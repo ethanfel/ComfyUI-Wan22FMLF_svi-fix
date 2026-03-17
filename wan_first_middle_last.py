@@ -1,11 +1,10 @@
-from typing_extensions import override
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 import torch
 import torch.nn.functional as F
 import node_helpers
 import comfy
 import comfy.utils
-import comfy.clip_vision
+from .utils import merge_clip_vision_outputs, create_spatial_gradient
 
 
 class WanFirstMiddleLastFrameToVideo(io.ComfyNode):
@@ -26,104 +25,46 @@ class WanFirstMiddleLastFrameToVideo(io.ComfyNode):
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
                 io.Vae.Input("vae"),
-                io.Int.Input(
-                    "width",
-                    default=832,
-                    min=16,
-                    max=8192,
-                    step=16,
-                    display_mode=io.NumberDisplay.number,
-                ),
-                io.Int.Input(
-                    "height",
-                    default=480,
-                    min=16,
-                    max=8192,
-                    step=16,
-                    display_mode=io.NumberDisplay.number,
-                ),
-                io.Int.Input(
-                    "length",
-                    default=81,
-                    min=1,
-                    max=8192,
-                    step=4,
-                    display_mode=io.NumberDisplay.number,
-                ),
-                io.Int.Input(
-                    "batch_size",
-                    default=1,
-                    min=1,
-                    max=4096,
-                    display_mode=io.NumberDisplay.number,
-                ),
-                io.Combo.Input("mode", ["NORMAL", "SINGLE_PERSON"], default="NORMAL", optional=True),
-                io.Image.Input("start_image", optional=True),
-                io.Image.Input("middle_image", optional=True),
-                io.Image.Input("end_image", optional=True),
-                io.Float.Input(
-                    "middle_frame_ratio",
-                    default=0.5,
-                    min=0.0,
-                    max=1.0,
-                    step=0.01,
-                    round=0.01,
-                    display_mode=io.NumberDisplay.slider,
-                    optional=True,
-                ),
-                io.Float.Input(
-                    "high_noise_mid_strength",
-                    default=0.8,
-                    min=0.0,
-                    max=1.0,
-                    step=0.05,
-                    round=0.01,
-                    display_mode=io.NumberDisplay.slider,
-                    optional=True,
-                ),
-                io.Float.Input(
-                    "low_noise_start_strength",
-                    default=1.0,
-                    min=0.0,
-                    max=1.0,
-                    step=0.05,
-                    round=0.01,
-                    display_mode=io.NumberDisplay.slider,
-                    optional=True,
-                ),
-                io.Float.Input(
-                    "low_noise_mid_strength",
-                    default=0.2,
-                    min=0.0,
-                    max=1.0,
-                    step=0.05,
-                    round=0.01,
-                    display_mode=io.NumberDisplay.slider,
-                    optional=True,
-                ),
-                io.Float.Input(
-                    "low_noise_end_strength",
-                    default=1.0,
-                    min=0.0,
-                    max=1.0,
-                    step=0.05,
-                    round=0.01,
-                    display_mode=io.NumberDisplay.slider,
-                    optional=True,
-                ),
-                io.Float.Input(
-                    "structural_repulsion_boost",
-                    default=1.0,
-                    min=1.0,
-                    max=2.0,
-                    step=0.05,
-                    round=0.01,
-                    display_mode=io.NumberDisplay.slider,
-                    optional=True,
-                ),
-                io.ClipVisionOutput.Input("clip_vision_start_image", optional=True),
-                io.ClipVisionOutput.Input("clip_vision_middle_image", optional=True),
-                io.ClipVisionOutput.Input("clip_vision_end_image", optional=True),
+                io.Int.Input("width", default=832, min=16, max=8192, step=16, display_mode=io.NumberDisplay.number,
+                           tooltip="Width of the generated video in pixels"),
+                io.Int.Input("height", default=480, min=16, max=8192, step=16, display_mode=io.NumberDisplay.number,
+                           tooltip="Height of the generated video in pixels"),
+                io.Int.Input("length", default=81, min=1, max=8192, step=4, display_mode=io.NumberDisplay.number,
+                           tooltip="Total number of frames in the generated video"),
+                io.Int.Input("batch_size", default=1, min=1, max=4096, display_mode=io.NumberDisplay.number,
+                           tooltip="Number of videos to generate"),
+                io.Combo.Input("mode", ["NORMAL", "SINGLE_PERSON"], default="NORMAL", optional=True,
+                             tooltip="NORMAL = all frames condition both stages\nSINGLE_PERSON = only start frame conditions low-noise stage (better identity consistency)"),
+                io.Image.Input("start_image", optional=True,
+                             tooltip="First frame reference image (anchor, fully conditioned)"),
+                io.Image.Input("middle_image", optional=True,
+                             tooltip="Middle frame reference image for better temporal consistency"),
+                io.Image.Input("end_image", optional=True,
+                             tooltip="Last frame reference image (anchor, fully conditioned)"),
+                io.Float.Input("middle_frame_ratio", default=0.5, min=0.0, max=1.0, step=0.01, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Temporal position of middle frame (0.0 = start, 1.0 = end)"),
+                io.Float.Input("high_noise_mid_strength", default=0.8, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for middle frame in high-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("low_noise_start_strength", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for start frame in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("low_noise_mid_strength", default=0.2, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for middle frame in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("low_noise_end_strength", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for end frame in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("structural_repulsion_boost", default=1.0, min=1.0, max=2.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Enhances motion between reference frames using spatial gradients\n1.0 = disabled, >1.0 = stronger repulsion in high-motion areas\nOnly affects high-noise stage"),
+                io.ClipVisionOutput.Input("clip_vision_start_image", optional=True,
+                                        tooltip="CLIP vision embedding for start frame"),
+                io.ClipVisionOutput.Input("clip_vision_middle_image", optional=True,
+                                        tooltip="CLIP vision embedding for middle frame"),
+                io.ClipVisionOutput.Input("clip_vision_end_image", optional=True,
+                                        tooltip="CLIP vision embedding for end frame"),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive_high"),
@@ -238,67 +179,48 @@ class WanFirstMiddleLastFrameToVideo(io.ComfyNode):
         if structural_repulsion_boost > 1.001 and length > 4:
             mask_h, mask_w = mask_high_noise.shape[-2], mask_high_noise.shape[-1]
             boost_factor = structural_repulsion_boost - 1.0
-            
-            def create_spatial_gradient(img1, img2):
-                if img1 is None or img2 is None:
-                    return None
-                
-                motion_diff = torch.abs(img2[0] - img1[0]).mean(dim=-1, keepdim=False)
-                motion_diff_4d = motion_diff.unsqueeze(0).unsqueeze(0)
-                motion_diff_scaled = F.interpolate(
-                    motion_diff_4d,
-                    size=(mask_h, mask_w),
-                    mode='bilinear',
-                    align_corners=False
-                )
-                
-                motion_normalized = (motion_diff_scaled - motion_diff_scaled.min()) / (motion_diff_scaled.max() - motion_diff_scaled.min() + 1e-8)
-                
-                spatial_gradient = 1.0 - motion_normalized * boost_factor * 2.5
-                spatial_gradient = torch.clamp(spatial_gradient, 0.02, 1.0)
-                return spatial_gradient[0, 0]
-            
+
             if start_image is not None and middle_image is not None:
                 start_img = start_image[0:1].to(device)
                 mid_img = middle_image[0:1].to(device)
-                
-                spatial_gradient_1 = create_spatial_gradient(start_img, mid_img)
-                
+
+                spatial_gradient_1 = create_spatial_gradient(start_img, mid_img, mask_h, mask_w, boost_factor)
+
                 if spatial_gradient_1 is not None:
                     start_end = start_image.shape[0] + 3
                     mid_protect_start = max(start_end, middle_idx - 4)
                     mid_protect_end = middle_idx + 5
                     transition_end = min(mid_protect_start, length)
-                    
+
                     for frame_idx in range(start_end, transition_end):
                         current_mask = mask_high_noise[:, :, frame_idx, :, :]
                         mask_high_noise[:, :, frame_idx, :, :] = current_mask * spatial_gradient_1
-            
+
             if middle_image is not None and end_image is not None:
                 mid_img = middle_image[0:1].to(device)
                 end_img = end_image[-1:].to(device)
-                
-                spatial_gradient_2 = create_spatial_gradient(mid_img, end_img)
-                
+
+                spatial_gradient_2 = create_spatial_gradient(mid_img, end_img, mask_h, mask_w, boost_factor)
+
                 if spatial_gradient_2 is not None:
                     mid_protect_end = middle_idx + 5
                     transition_start = mid_protect_end
                     end_start = length - end_image.shape[0]
-                    
+
                     for frame_idx in range(transition_start, end_start):
                         current_mask = mask_high_noise[:, :, frame_idx, :, :]
                         mask_high_noise[:, :, frame_idx, :, :] = current_mask * spatial_gradient_2
-            
+
             if start_image is not None and end_image is not None and middle_image is None:
                 start_img = start_image[0:1].to(device)
                 end_img = end_image[-1:].to(device)
-                
-                spatial_gradient = create_spatial_gradient(start_img, end_img)
-                
+
+                spatial_gradient = create_spatial_gradient(start_img, end_img, mask_h, mask_w, boost_factor)
+
                 if spatial_gradient is not None:
                     start_end = start_image.shape[0] + 3
                     end_start = length - end_image.shape[0]
-                    
+
                     for frame_idx in range(start_end, end_start):
                         current_mask = mask_high_noise[:, :, frame_idx, :, :]
                         mask_high_noise[:, :, frame_idx, :, :] = current_mask * spatial_gradient
@@ -322,7 +244,7 @@ class WanFirstMiddleLastFrameToVideo(io.ComfyNode):
 
             concat_latent_image_low = vae.encode(image_low_only[:, :, :, :3])
         else:
-            # 低噪阶段使用原始 latent（不受运动增强影响）
+            # Low-noise stage uses original latent (unaffected by motion enhancement)
             concat_latent_image_low = concat_latent_image
 
         mask_high_reshaped = mask_high_noise.view(
@@ -357,7 +279,7 @@ class WanFirstMiddleLastFrameToVideo(io.ComfyNode):
             "concat_mask": mask_high_reshaped
         })
 
-        clip_vision_output = cls._merge_clip_vision_outputs(
+        clip_vision_output = merge_clip_vision_outputs(
             clip_vision_start_image,
             clip_vision_middle_image,
             clip_vision_end_image
@@ -386,20 +308,4 @@ class WanFirstMiddleLastFrameToVideo(io.ComfyNode):
         aligned_idx = max(0, min(aligned_idx, total_frames - 1))
         return aligned_idx
 
-    @classmethod
-    def _merge_clip_vision_outputs(cls, *outputs):
-        valid_outputs = [o for o in outputs if o is not None]
-
-        if not valid_outputs:
-            return None
-
-        if len(valid_outputs) == 1:
-            return valid_outputs[0]
-
-        all_states = [o.penultimate_hidden_states for o in valid_outputs]
-        combined_states = torch.cat(all_states, dim=-2)
-
-        result = comfy.clip_vision.Output()
-        result.penultimate_hidden_states = combined_states
-        return result
 

@@ -1,12 +1,11 @@
-from typing_extensions import override
 from comfy_api.latest import io
 import torch
 import torch.nn.functional as F
 import json
-from typing import List, Tuple, Optional, Any
 import node_helpers
 import comfy
 import comfy.utils
+from .utils import merge_clip_vision_outputs, create_spatial_gradient
 
 
 class WanMultiFrameRefToVideo(io.ComfyNode):
@@ -27,19 +26,32 @@ class WanMultiFrameRefToVideo(io.ComfyNode):
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
                 io.Vae.Input("vae"),
-                io.Int.Input("width", default=832, min=16, max=8192, step=16, display_mode=io.NumberDisplay.number),
-                io.Int.Input("height", default=480, min=16, max=8192, step=16, display_mode=io.NumberDisplay.number),
-                io.Int.Input("length", default=81, min=1, max=8192, step=4, display_mode=io.NumberDisplay.number),
-                io.Int.Input("batch_size", default=1, min=1, max=4096, display_mode=io.NumberDisplay.number),
-                io.Image.Input("ref_images"),
-                io.Combo.Input("mode", ["NORMAL", "SINGLE_PERSON"], default="NORMAL", optional=True),
-                io.String.Input("ref_positions", default="", optional=True),
-                io.Float.Input("ref_strength_high", default=0.8, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True),
-                io.Float.Input("ref_strength_low", default=0.2, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True),
-                io.Float.Input("end_frame_strength_high", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True),
-                io.Float.Input("end_frame_strength_low", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True),
-                io.Float.Input("structural_repulsion_boost", default=1.0, min=1.0, max=2.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True),
-                io.ClipVisionOutput.Input("clip_vision_output", optional=True),
+                io.Int.Input("width", default=832, min=16, max=8192, step=16, display_mode=io.NumberDisplay.number,
+                           tooltip="Width of the generated video in pixels"),
+                io.Int.Input("height", default=480, min=16, max=8192, step=16, display_mode=io.NumberDisplay.number,
+                           tooltip="Height of the generated video in pixels"),
+                io.Int.Input("length", default=81, min=1, max=8192, step=4, display_mode=io.NumberDisplay.number,
+                           tooltip="Total number of frames in the generated video"),
+                io.Int.Input("batch_size", default=1, min=1, max=4096, display_mode=io.NumberDisplay.number,
+                           tooltip="Number of videos to generate"),
+                io.Image.Input("ref_images",
+                             tooltip="Batch of reference images placed at positions along the timeline"),
+                io.Combo.Input("mode", ["NORMAL", "SINGLE_PERSON"], default="NORMAL", optional=True,
+                             tooltip="NORMAL = all frames condition both stages\nSINGLE_PERSON = only first frame conditions low-noise stage (better identity consistency)"),
+                io.String.Input("ref_positions", default="", optional=True,
+                              tooltip="Comma-separated frame positions for each reference image\nValues 0.0-1.99 are treated as ratios, >=2 as pixel frame indices\nLeave empty for even spacing"),
+                io.Float.Input("ref_strength_high", default=0.8, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for intermediate reference frames in high-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("ref_strength_low", default=0.2, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for intermediate reference frames in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("end_frame_strength_high", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for the last reference frame in high-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("end_frame_strength_low", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for the last reference frame in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("structural_repulsion_boost", default=1.0, min=1.0, max=2.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Enhances motion between reference frames using spatial gradients\n1.0 = disabled, >1.0 = stronger repulsion in high-motion areas\nOnly affects high-noise stage"),
+                io.ClipVisionOutput.Input("clip_vision_output", optional=True,
+                                        tooltip="CLIP vision embedding for semantic guidance"),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive_high"),
@@ -137,43 +149,24 @@ class WanMultiFrameRefToVideo(io.ComfyNode):
         if structural_repulsion_boost > 1.001 and length > 4 and n_imgs >= 2:
             mask_h, mask_w = mask_high_noise.shape[-2], mask_high_noise.shape[-1]
             boost_factor = structural_repulsion_boost - 1.0
-            
-            def create_spatial_gradient(img1, img2):
-                if img1 is None or img2 is None:
-                    return None
-                
-                motion_diff = torch.abs(img2[0] - img1[0]).mean(dim=-1, keepdim=False)
-                motion_diff_4d = motion_diff.unsqueeze(0).unsqueeze(0)
-                motion_diff_scaled = F.interpolate(
-                    motion_diff_4d,
-                    size=(mask_h, mask_w),
-                    mode='bilinear',
-                    align_corners=False
-                )
-                
-                motion_normalized = (motion_diff_scaled - motion_diff_scaled.min()) / (motion_diff_scaled.max() - motion_diff_scaled.min() + 1e-8)
-                
-                spatial_gradient = 1.0 - motion_normalized * boost_factor * 2.5
-                spatial_gradient = torch.clamp(spatial_gradient, 0.02, 1.0)
-                return spatial_gradient[0, 0]
-            
+
             for i in range(n_imgs - 1):
                 pos1 = int(aligned_positions[i])
                 pos2 = int(aligned_positions[i + 1])
-                
+
                 if pos2 > pos1 + 4:
                     start_end = pos1 + 4
                     end_start = pos2
                     protect_start = pos2 - 4
-                    
+
                     img1 = imgs[i:i+1].to(device)
                     img2 = imgs[i+1:i+2].to(device)
-                    
-                    spatial_gradient = create_spatial_gradient(img1, img2)
-                    
+
+                    spatial_gradient = create_spatial_gradient(img1, img2, mask_h, mask_w, boost_factor)
+
                     if spatial_gradient is not None:
                         transition_end = min(protect_start, end_start)
-                        
+
                         for frame_idx in range(start_end, transition_end):
                             current_mask = mask_high_noise[:, :, frame_idx, :, :]
                             mask_high_noise[:, :, frame_idx, :, :] = current_mask * spatial_gradient

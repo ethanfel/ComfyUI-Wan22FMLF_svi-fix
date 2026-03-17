@@ -1,23 +1,20 @@
-from typing_extensions import override
 from comfy_api.latest import io
 import torch
 import node_helpers
 import comfy
 import comfy.utils
-import comfy.clip_vision
 import comfy.latent_formats
-from typing import Optional
-import math
+from .utils import merge_clip_vision_outputs, create_spatial_gradient
 
 
 class WanSVIProAdvancedI2V(io.ComfyNode):
-    
+
     RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "CONDITIONING", "LATENT", "INT", "INT", "INT")
     RETURN_NAMES = ("positive_high", "positive_low", "negative", "latent", "trim_latent", "trim_image", "next_offset")
     CATEGORY = "ComfyUI-Wan22FMLF"
     FUNCTION = "execute"
     OUTPUT_NODE = False
-    
+
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
@@ -25,6 +22,7 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
             display_name="Wan SVI Pro Advanced I2V",
             category="ComfyUI-Wan22FMLF",
             inputs=[
+                # Core
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
                 io.Vae.Input("vae"),
@@ -35,74 +33,75 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
                 io.Int.Input("length", default=81, min=1, max=8192, step=4, display_mode=io.NumberDisplay.number,
                            tooltip="Total number of frames in the generated video"),
                 io.Int.Input("batch_size", default=1, min=1, max=4096, display_mode=io.NumberDisplay.number,
-                           tooltip="Batch size (number of videos to generate)"),
-                
-                # 动态调整参数（1.0 = 无增强）
-                io.Float.Input("motion_boost", default=1.0, min=1.0, max=3.0, step=0.1, round=0.1,
-                             display_mode=io.NumberDisplay.slider, optional=True,
-                             tooltip="Motion amplitude amplification\n1.0 = no amplification\n>1.0 = amplify movement"),
-                io.Float.Input("detail_boost", default=1.0, min=1.0, max=4.0, step=0.1, round=0.1,
-                             display_mode=io.NumberDisplay.slider, optional=True,
-                             tooltip="Motion dynamic strength\n1.0 = balanced\n>1.0 = stronger motion dynamics"),
-                io.Float.Input("motion_influence", default=1.0, min=0.0, max=2.0, step=0.05, round=0.01, 
-                             display_mode=io.NumberDisplay.slider,
-                             tooltip="Influence strength of motion latent from previous video\n1.0 = normal, <1.0 = weaker, >1.0 = stronger"),
-                
-                # 重叠帧参数（以图像帧为单位，必须是4的倍数）
-                io.Int.Input("overlap_frames", default=4, min=0, max=128, step=4, display_mode=io.NumberDisplay.number,
-                           tooltip="Number of overlapping frames (pixel frames). 4 frames = 1 latent frame."),
-                
-                # 起始帧组
+                           tooltip="Number of videos to generate"),
+
+                # Start frame
                 io.Image.Input("start_image", optional=True,
-                             tooltip="First frame reference image (anchor for the video). If provided, overrides anchor_samples."),
-                io.Boolean.Input("enable_start_frame", default=True, optional=True,
-                               tooltip="Enable start frame conditioning"),
-                io.Float.Input("high_noise_start_strength", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01, 
-                             display_mode=io.NumberDisplay.slider, optional=True,
-                             tooltip="Conditioning strength for start frame in high-noise stage\n0.0 = full condition, 1.0 = no condition"),
-                io.Float.Input("low_noise_start_strength", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01, 
-                             display_mode=io.NumberDisplay.slider, optional=True,
-                             tooltip="Conditioning strength for start frame in low-noise stage"),
-                
-                # 中间帧组
-                io.Image.Input("middle_image", optional=True,
-                             tooltip="Middle frame reference image for better consistency"),
-                io.Boolean.Input("enable_middle_frame", default=True, optional=True,
-                               tooltip="Enable middle frame conditioning"),
-                io.Float.Input("middle_frame_ratio", default=0.5, min=0.0, max=1.0, step=0.01, round=0.01, 
-                             display_mode=io.NumberDisplay.slider, optional=True,
-                             tooltip="Position of middle frame (0=start, 1=end)"),
-                io.Float.Input("high_noise_mid_strength", default=0.8, min=0.0, max=1.0, step=0.05, round=0.01, 
-                             display_mode=io.NumberDisplay.slider, optional=True,
-                             tooltip="Conditioning strength for middle frame in high-noise stage"),
-                io.Float.Input("low_noise_mid_strength", default=0.2, min=0.0, max=1.0, step=0.05, round=0.01, 
-                             display_mode=io.NumberDisplay.slider, optional=True,
-                             tooltip="Conditioning strength for middle frame in low-noise stage"),
-                
-                # 结束帧组
-                io.Image.Input("end_image", optional=True,
-                             tooltip="Last frame reference image (target ending)"),
-                io.Boolean.Input("enable_end_frame", default=True, optional=True,
-                               tooltip="Enable end frame conditioning"),
-                io.Float.Input("low_noise_end_strength", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01, 
-                             display_mode=io.NumberDisplay.slider, optional=True,
-                             tooltip="Conditioning strength for end frame in low-noise stage"),
-                
-                # 其他参数
+                             tooltip="First frame reference image (anchor). Overrides anchor_samples if provided."),
                 io.ClipVisionOutput.Input("clip_vision_start_image", optional=True,
                                         tooltip="CLIP vision embedding for start frame"),
+                io.Boolean.Input("enable_start_frame", default=True, optional=True,
+                               tooltip="Enable start frame conditioning"),
+                io.Float.Input("high_noise_start_strength", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for start frame in high-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("low_noise_start_strength", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for start frame in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+
+                # Middle frame
+                io.Image.Input("middle_image", optional=True,
+                             tooltip="Middle frame reference image for better temporal consistency"),
                 io.ClipVisionOutput.Input("clip_vision_middle_image", optional=True,
                                         tooltip="CLIP vision embedding for middle frame"),
+                io.Boolean.Input("enable_middle_frame", default=True, optional=True,
+                               tooltip="Enable middle frame conditioning"),
+                io.Float.Input("middle_frame_ratio", default=0.5, min=0.0, max=1.0, step=0.01, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Temporal position of middle frame (0.0 = start, 1.0 = end)"),
+                io.Float.Input("high_noise_mid_strength", default=0.8, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for middle frame in high-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("low_noise_mid_strength", default=0.2, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for middle frame in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+
+                # End frame
+                io.Image.Input("end_image", optional=True,
+                             tooltip="Last frame reference image (target ending)"),
                 io.ClipVisionOutput.Input("clip_vision_end_image", optional=True,
                                         tooltip="CLIP vision embedding for end frame"),
-                
-                # 原版核心输入（anchor_samples 保留，但优先使用 start_image）
-                io.Latent.Input("anchor_samples", optional=True,
-                              tooltip="Anchor latent samples (from VAE encode). Ignored if start_image is provided."),
+                io.Boolean.Input("enable_end_frame", default=True, optional=True,
+                               tooltip="Enable end frame conditioning"),
+                io.Float.Input("low_noise_end_strength", default=1.0, min=0.0, max=1.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Conditioning strength for end frame in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+
+                # Continuation (prev_latent)
                 io.Latent.Input("prev_latent", optional=True,
                               tooltip="Previous video latent for seamless continuation"),
-                io.Int.Input("video_frame_offset", default=0, min=0, max=1000000, step=1, display_mode=io.NumberDisplay.number, 
-                           optional=True, tooltip="Video frame offset (advanced)"),
+                io.Latent.Input("anchor_samples", optional=True,
+                              tooltip="Anchor latent samples (from VAE encode). Ignored if start_image is provided."),
+                io.Int.Input("overlap_frames", default=4, min=0, max=128, step=4, display_mode=io.NumberDisplay.number,
+                           tooltip="Number of overlapping pixel frames from prev_latent. 4 frames = 1 latent frame."),
+                io.Float.Input("motion_influence", default=1.0, min=0.0, max=2.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider,
+                             tooltip="Overall strength of motion latent from prev_latent\n1.0 = normal, <1.0 = weaker, >1.0 = stronger"),
+
+                # Enhancement
+                io.Float.Input("motion_boost", default=1.0, min=0.5, max=3.0, step=0.1, round=0.1,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Scale frame-to-frame motion differences in prev_latent\n<1.0 = dampen movement\n1.0 = no change\n>1.0 = amplify movement"),
+                io.Float.Input("detail_boost", default=1.0, min=0.5, max=4.0, step=0.1, round=0.1,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Controls conditioning decay rate over motion frames\n<1.0 = slower decay, more conditioning retained\n1.0 = balanced\n>1.0 = faster decay, more dynamic freedom"),
+                io.Float.Input("structural_repulsion_boost", default=1.0, min=1.0, max=2.0, step=0.05, round=0.01,
+                             display_mode=io.NumberDisplay.slider, optional=True,
+                             tooltip="Enhances motion between reference frames using spatial gradients\n1.0 = disabled, >1.0 = stronger repulsion in high-motion areas\nOnly affects high-noise stage"),
+
+                # Advanced
+                io.Int.Input("video_frame_offset", default=0, min=0, max=1000000, step=1, display_mode=io.NumberDisplay.number,
+                           optional=True, tooltip="Frame offset for image sequences spanning multiple clips"),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive_high"),
@@ -126,20 +125,21 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
                 end_image=None, enable_end_frame=True, low_noise_end_strength=1.0,
                 clip_vision_start_image=None, clip_vision_middle_image=None,
                 clip_vision_end_image=None,
+                structural_repulsion_boost=1.0,
                 anchor_samples=None, prev_latent=None, video_frame_offset=0):
-        
-        # --- 基本参数计算 ---
+
+        # --- Basic parameter computation ---
         spatial_scale = vae.spacial_compression_encode()
         latent_channels = vae.latent_channels
-        total_latents = ((length - 1) // 4) + 1          # 需要的潜变量帧总数
+        total_latents = ((length - 1) // 4) + 1          # Total latent frames needed
         H = height // spatial_scale
         W = width // spatial_scale
         device = comfy.model_management.intermediate_device()
 
-        # 空 latent（用于最终输出，采样时填充）
+        # Empty latent (for final output, filled during sampling)
         latent_out = torch.zeros([batch_size, latent_channels, total_latents, H, W], device=device)
 
-        # 偏移处理
+        # Offset handling
         trim_latent = 0
         trim_image = 0
         next_offset = 0
@@ -152,7 +152,7 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
                 end_image = end_image[video_frame_offset:] if end_image.shape[0] > video_frame_offset else None
             next_offset = video_frame_offset + length
 
-        # 中间帧潜变量位置（像素帧索引转潜变量帧索引）
+        # Middle frame latent position (pixel frame index to latent frame index)
         if middle_image is not None:
             middle_pixel_idx = int((length - 1) * middle_frame_ratio)
             middle_pixel_idx = max(4, min(middle_pixel_idx, length - 5))
@@ -160,27 +160,27 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
         else:
             middle_latent_idx = None
 
-        # --- 获取锚点潜变量（优先使用 start_image） ---
+        # --- Get anchor latent (start_image takes priority) ---
         anchor_latent = None
         if start_image is not None and enable_start_frame:
-            # 编码起始图像
-            img = start_image[:1, :, :, :3]  # 取第一张，确保形状正确
+            # Encode start image
+            img = start_image[:1, :, :, :3]
             img = comfy.utils.common_upscale(img.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
             anchor_latent = vae.encode(img)  # shape: [1, C, 1, H, W]
         elif anchor_samples is not None:
             anchor_latent = anchor_samples["samples"].clone()
-            # 如果多帧，只取第一帧作为锚点（与后续拼接逻辑保持一致）
+            # If multi-frame, use only the first frame as anchor
             if anchor_latent.shape[2] > 1:
                 print("[SVI Pro Advanced] Warning: anchor_samples has multiple frames, using only the first.")
                 anchor_latent = anchor_latent[:, :, :1, :, :]
         else:
-            # 没有任何锚点，报错或创建零张量（这里创建零张量，但建议工作流确保有锚点）
+            # No anchor provided, create zero tensor (workflow should ensure an anchor exists)
             print("[SVI Pro Advanced] Warning: No anchor provided, using zeros.")
             anchor_latent = torch.zeros([1, latent_channels, 1, H, W], device=device)
 
-        # 确定 dtype：使用 anchor_latent 的 dtype
+        # Determine dtype from anchor_latent
         dtype = anchor_latent.dtype
-        # 确保 latent_out 的 dtype 与锚点一致（虽然它只是占位，但为了统一）
+        # Ensure latent_out dtype matches anchor
         latent_out = latent_out.to(dtype)
 
         # --- Get motion continuation latent from prev_latent ---
@@ -188,6 +188,7 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
         motion_start = 0
         motion_end = 0
         has_prev_latent = (prev_latent is not None and prev_latent.get("samples") is not None)
+        motion_latent_frames = 0
 
         if has_prev_latent:
             prev_samples = prev_latent["samples"]
@@ -206,8 +207,8 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
             motion_start = 1 if enable_start_frame else 0
             motion_end = min(motion_start + use_frames, total_latents)
 
-            # Apply motion_boost first (amplify frame-to-frame differences)
-            if motion_latent.shape[2] >= 2 and motion_boost > 1.0:
+            # Apply motion_boost (amplify or dampen frame-to-frame differences)
+            if motion_latent.shape[2] >= 2 and motion_boost != 1.0:
                 boosted = [motion_latent[:, :, 0:1].clone()]
                 for i in range(1, motion_latent.shape[2]):
                     diff = motion_latent[:, :, i] - motion_latent[:, :, i-1]
@@ -261,13 +262,13 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
             end_latent_enc = vae.encode(img_end[:1, :, :, :3])
             image_cond_latent[:, :, total_latents - 1:total_latents] = end_latent_enc
 
-        # --- Build masks with decay for motion frames (restored from upstream) ---
+        # --- Build masks with decay for motion frames ---
         # detail_boost controls decay rate: higher = faster decay = more dynamic freedom
         # At detail_boost=1.0 decay_rate=0.7, at 4.0 decay_rate=0.1
         decay_rate = max(0.05, min(0.9, 0.7 - (detail_boost - 1.0) * 0.2))
 
-        mask_high = torch.ones((1, 1, total_latents, H, W), device=device, dtype=dtype)
-        mask_low = torch.ones((1, 1, total_latents, H, W), device=device, dtype=dtype)
+        mask_high = torch.ones((1, 4, total_latents, H, W), device=device, dtype=dtype)
+        mask_low = torch.ones((1, 4, total_latents, H, W), device=device, dtype=dtype)
 
         # Start frame strength
         if enable_start_frame and anchor_latent is not None:
@@ -294,7 +295,42 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
             mask_high[:, :, total_latents - 1:total_latents] = 0.0
             mask_low[:, :, total_latents - 1:total_latents] = max(0.0, 1.0 - low_noise_end_strength)
 
-        # --- 构建 conditioning ---
+        # --- Structural repulsion boost (spatial gradient conditioning) ---
+        if structural_repulsion_boost > 1.001 and total_latents > 1:
+            boost_factor = structural_repulsion_boost - 1.0
+
+            # Collect valid reference frames as (resized_image, latent_index) tuples
+            ref_frames = []
+            if enable_start_frame and start_image is not None:
+                ref_img = comfy.utils.common_upscale(
+                    start_image[:1].movedim(-1, 1), width, height, "bilinear", "center"
+                ).movedim(1, -1)
+                ref_frames.append((ref_img, 0))
+            if img_mid is not None and enable_middle_frame and actual_middle_idx < total_latents:
+                ref_frames.append((img_mid, actual_middle_idx))
+            if img_end is not None and enable_end_frame:
+                ref_frames.append((img_end, total_latents - 1))
+
+            for i in range(len(ref_frames) - 1):
+                img1, pos1 = ref_frames[i]
+                img2, pos2 = ref_frames[i + 1]
+
+                if pos2 > pos1 + 1:
+                    spatial_gradient = create_spatial_gradient(
+                        img1[0:1].to(device), img2[0:1].to(device), H, W, boost_factor
+                    )
+
+                    if spatial_gradient is not None:
+                        # Apply to transition zone, protecting 1 latent frame around each reference
+                        start_end = pos1 + 1
+                        protect_start = pos2 - 1
+                        transition_end = min(protect_start, pos2)
+
+                        for frame_idx in range(start_end, transition_end):
+                            current_mask = mask_high[:, :, frame_idx, :, :]
+                            mask_high[:, :, frame_idx, :, :] = current_mask * spatial_gradient
+
+        # --- Build conditioning ---
         positive_high = node_helpers.conditioning_set_values(positive, {
             "concat_latent_image": image_cond_latent,
             "concat_mask": mask_high
@@ -305,11 +341,11 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
         })
         negative_out = node_helpers.conditioning_set_values(negative, {
             "concat_latent_image": image_cond_latent,
-            "concat_mask": mask_high  # 通常 negative 使用高噪声掩码
+            "concat_mask": mask_high  # Negative typically uses the high-noise mask
         })
 
-        # --- 处理 CLIP vision（保持不变）---
-        clip_vision_output = cls._merge_clip_vision_outputs(
+        # --- Handle CLIP vision ---
+        clip_vision_output = merge_clip_vision_outputs(
             clip_vision_start_image if enable_start_frame else None,
             clip_vision_middle_image if enable_middle_frame else None,
             clip_vision_end_image if enable_end_frame else None
@@ -323,22 +359,10 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
         return io.NodeOutput(positive_high, positive_low, negative_out, out_latent,
                              trim_latent, trim_image, next_offset)
 
-    @classmethod
-    def _merge_clip_vision_outputs(cls, *outputs):
-        valid_outputs = [o for o in outputs if o is not None]
-        if not valid_outputs:
-            return None
-        if len(valid_outputs) == 1:
-            return valid_outputs[0]
-        all_states = [o.penultimate_hidden_states for o in valid_outputs]
-        combined_states = torch.cat(all_states, dim=-2)
-        result = comfy.clip_vision.Output()
-        result.penultimate_hidden_states = combined_states
-        return result
 
 
 # ===========================================
-# 节点注册
+# Node Registration
 # ===========================================
 NODE_CLASS_MAPPINGS = {
     "WanSVIProAdvancedI2V": WanSVIProAdvancedI2V,
