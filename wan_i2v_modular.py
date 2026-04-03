@@ -9,6 +9,7 @@ OPTIONS_DEFAULTS = {
     "low_noise_start_strength":  1.0,
     "low_noise_mid_strength":    0.2,
     "low_noise_end_strength":    1.0,
+    "middle_frame_ratio":        0.5,
     # Continuation
     "long_video_mode":           "DISABLED",
     "motion_frames":             None,
@@ -59,6 +60,10 @@ class WanStrengthOptions(io.ComfyNode):
                                step=0.05, round=0.01,
                                display_mode=io.NumberDisplay.slider, optional=True,
                                tooltip="Conditioning strength for end frame in low-noise stage\n0.0 = ignore, 1.0 = fully conditioned"),
+                io.Float.Input("middle_frame_ratio", default=0.5, min=0.0, max=1.0,
+                               step=0.01, round=0.01,
+                               display_mode=io.NumberDisplay.slider, optional=True,
+                               tooltip="Temporal position of middle frame (0.0 = start, 1.0 = end)"),
             ],
             outputs=[
                 _WAN_I2V_OPTIONS.Output(display_name="options"),
@@ -69,7 +74,7 @@ class WanStrengthOptions(io.ComfyNode):
     def execute(cls, options=None,
                 high_noise_start_strength=1.0, high_noise_mid_strength=0.8,
                 low_noise_start_strength=1.0, low_noise_mid_strength=0.2,
-                low_noise_end_strength=1.0):
+                low_noise_end_strength=1.0, middle_frame_ratio=0.5):
         out = dict(OPTIONS_DEFAULTS)
         if options:
             out.update(options)
@@ -79,6 +84,7 @@ class WanStrengthOptions(io.ComfyNode):
             "low_noise_start_strength":  low_noise_start_strength,
             "low_noise_mid_strength":    low_noise_mid_strength,
             "low_noise_end_strength":    low_noise_end_strength,
+            "middle_frame_ratio":        middle_frame_ratio,
         })
         return io.NodeOutput(out)
 
@@ -223,10 +229,6 @@ class WanI2VBase(io.ComfyNode):
                                tooltip="Middle frame reference image for better temporal consistency"),
                 io.Image.Input("end_image", optional=True,
                                tooltip="Last frame reference image (target ending)"),
-                io.Float.Input("middle_frame_ratio", default=0.5, min=0.0, max=1.0,
-                               step=0.01, round=0.01,
-                               display_mode=io.NumberDisplay.slider, optional=True,
-                               tooltip="Temporal position of middle frame (0.0 = start, 1.0 = end)"),
                 # Mode
                 io.Combo.Input("mode", ["NORMAL", "SINGLE_PERSON"], default="NORMAL", optional=True,
                                tooltip="NORMAL = all frames condition both stages\nSINGLE_PERSON = only start frame conditions low-noise stage"),
@@ -249,7 +251,6 @@ class WanI2VBase(io.ComfyNode):
     @classmethod
     def execute(cls, positive, negative, vae, width, height, length, batch_size,
                 start_image=None, middle_image=None, end_image=None,
-                middle_frame_ratio=0.5,
                 mode="NORMAL", structural_repulsion_boost=1.0,
                 options=None):
 
@@ -262,6 +263,7 @@ class WanI2VBase(io.ComfyNode):
         low_noise_start_strength  = opts["low_noise_start_strength"]
         low_noise_mid_strength    = opts["low_noise_mid_strength"]
         low_noise_end_strength    = opts["low_noise_end_strength"]
+        middle_frame_ratio        = opts["middle_frame_ratio"]
         long_video_mode           = opts["long_video_mode"]
         motion_frames             = opts["motion_frames"]
         prev_latent               = opts["prev_latent"]
