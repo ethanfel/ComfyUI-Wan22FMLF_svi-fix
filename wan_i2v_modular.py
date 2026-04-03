@@ -227,13 +227,6 @@ class WanI2VBase(io.ComfyNode):
                                step=0.01, round=0.01,
                                display_mode=io.NumberDisplay.slider, optional=True,
                                tooltip="Temporal position of middle frame (0.0 = start, 1.0 = end)"),
-                # Frame enables
-                io.Boolean.Input("enable_start_frame", default=True, optional=True,
-                                 tooltip="Enable start frame conditioning"),
-                io.Boolean.Input("enable_middle_frame", default=True, optional=True,
-                                 tooltip="Enable middle frame conditioning"),
-                io.Boolean.Input("enable_end_frame", default=True, optional=True,
-                                 tooltip="Enable end frame conditioning"),
                 # Mode
                 io.Combo.Input("mode", ["NORMAL", "SINGLE_PERSON"], default="NORMAL", optional=True,
                                tooltip="NORMAL = all frames condition both stages\nSINGLE_PERSON = only start frame conditions low-noise stage"),
@@ -260,7 +253,6 @@ class WanI2VBase(io.ComfyNode):
     def execute(cls, positive, negative, vae, width, height, length, batch_size,
                 start_image=None, middle_image=None, end_image=None,
                 middle_frame_ratio=0.5,
-                enable_start_frame=True, enable_middle_frame=True, enable_end_frame=True,
                 mode="NORMAL", structural_repulsion_boost=1.0,
                 options=None):
 
@@ -300,12 +292,12 @@ class WanI2VBase(io.ComfyNode):
             low_noise_mid_strength=low_noise_mid_strength,
             low_noise_end_strength=low_noise_end_strength,
             structural_repulsion_boost=structural_repulsion_boost,
-            clip_vision_start_image=clip_vision_start_image if enable_start_frame else None,
-            clip_vision_middle_image=clip_vision_middle_image if enable_middle_frame else None,
-            clip_vision_end_image=clip_vision_end_image if enable_end_frame else None,
-            enable_start_frame=enable_start_frame,
-            enable_middle_frame=enable_middle_frame,
-            enable_end_frame=enable_end_frame,
+            clip_vision_start_image=clip_vision_start_image,
+            clip_vision_middle_image=clip_vision_middle_image,
+            clip_vision_end_image=clip_vision_end_image,
+            enable_start_frame=start_image is not None,
+            enable_middle_frame=middle_image is not None,
+            enable_end_frame=end_image is not None,
             svi_motion_strength=svi_motion_strength,
             prev_latent=prev_latent,
         )
