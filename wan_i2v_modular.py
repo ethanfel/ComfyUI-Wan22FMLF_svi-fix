@@ -1,4 +1,10 @@
 from comfy_api.latest import io
+import torch
+import node_helpers
+import comfy
+import comfy.utils
+import comfy.latent_formats
+from .utils import merge_clip_vision_outputs, create_spatial_gradient
 
 _WAN_I2V_OPTIONS = io.Custom("WAN_I2V_OPTIONS")
 
@@ -282,31 +288,284 @@ class WanI2VBase(io.ComfyNode):
         clip_vision_middle_image  = opts["clip_vision_middle_image"]
         clip_vision_end_image     = opts["clip_vision_end_image"]
 
-        from .wan_advanced_i2v import WanAdvancedI2V
-        result = WanAdvancedI2V.execute(
-            positive=positive, negative=negative, vae=vae,
-            width=width, height=height, length=length, batch_size=batch_size,
-            mode=mode,
-            start_image=start_image, middle_image=middle_image, end_image=end_image,
-            middle_frame_ratio=middle_frame_ratio,
-            motion_frames=motion_frames,
-            video_frame_offset=video_frame_offset,
-            long_video_mode=long_video_mode,
-            continue_frames_count=continue_frames_count,
-            high_noise_start_strength=high_noise_start_strength,
-            high_noise_mid_strength=high_noise_mid_strength,
-            low_noise_start_strength=low_noise_start_strength,
-            low_noise_mid_strength=low_noise_mid_strength,
-            low_noise_end_strength=low_noise_end_strength,
-            structural_repulsion_boost=structural_repulsion_boost,
-            clip_vision_start_image=clip_vision_start_image,
-            clip_vision_middle_image=clip_vision_middle_image,
-            clip_vision_end_image=clip_vision_end_image,
-            enable_start_frame=enable_start_frame and start_image is not None,
-            enable_middle_frame=enable_middle_frame and middle_image is not None,
-            enable_end_frame=enable_end_frame and end_image is not None,
-            svi_motion_strength=svi_motion_strength,
-            prev_latent=prev_latent,
+        enable_start_frame  = enable_start_frame  and start_image  is not None
+        enable_middle_frame = enable_middle_frame and middle_image is not None
+        enable_end_frame    = enable_end_frame    and end_image    is not None
+
+        spacial_scale   = vae.spacial_compression_encode()
+        latent_channels = vae.latent_channels
+        latent_t        = ((length - 1) // 4) + 1
+        device          = comfy.model_management.intermediate_device()
+
+        latent = torch.zeros([batch_size, latent_channels, latent_t,
+                              height // spacial_scale, width // spacial_scale],
+                             device=device)
+
+        has_motion_frames  = (motion_frames is not None and motion_frames.shape[0] > 0)
+        is_pure_triple_mode = (not has_motion_frames and long_video_mode == "DISABLED")
+
+        if video_frame_offset >= 0:
+            if (long_video_mode in ("AUTO_CONTINUE", "SVI")) and has_motion_frames and continue_frames_count > 0:
+                actual_count  = min(continue_frames_count, motion_frames.shape[0])
+                motion_frames = motion_frames[-actual_count:]
+                video_frame_offset = max(0, video_frame_offset - motion_frames.shape[0])
+
+            if video_frame_offset > 0:
+                if start_image is not None and start_image.shape[0] > 1:
+                    start_image = start_image[video_frame_offset:] if start_image.shape[0] > video_frame_offset else None
+                if middle_image is not None and middle_image.shape[0] > 1:
+                    middle_image = middle_image[video_frame_offset:] if middle_image.shape[0] > video_frame_offset else None
+                if end_image is not None and end_image.shape[0] > 1:
+                    end_image = end_image[video_frame_offset:] if end_image.shape[0] > video_frame_offset else None
+
+        if motion_frames is not None:
+            motion_frames = comfy.utils.common_upscale(
+                motion_frames.movedim(-1, 1), width, height, "area", "center"
+            ).movedim(1, -1)
+
+        if start_image is not None:
+            start_image = comfy.utils.common_upscale(
+                start_image[:length if is_pure_triple_mode else 1].movedim(-1, 1),
+                width, height, "bilinear", "center"
+            ).movedim(1, -1)
+
+        if middle_image is not None:
+            middle_image = comfy.utils.common_upscale(
+                middle_image[:1].movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)
+
+        if end_image is not None:
+            end_image = comfy.utils.common_upscale(
+                end_image[-length if is_pure_triple_mode else -1:].movedim(-1, 1),
+                width, height, "bilinear", "center"
+            ).movedim(1, -1)
+
+        image     = torch.ones((length, height, width, 3), device=device) * 0.5
+        mask_base = torch.ones((1, 1, latent_t * 4, latent.shape[-2], latent.shape[-1]), device=device)
+
+        desired_pixel_idx = int(length * middle_frame_ratio)
+        middle_idx = (desired_pixel_idx // 4) * 4
+        middle_idx = max(4, min(middle_idx, length - 5))
+
+        mask_high_noise = mask_base.clone()
+        mask_low_noise  = mask_base.clone()
+
+        svi_continue_mode = False
+
+        # --- LATENT_CONTINUE ---
+        latent_continue_mode   = False
+        prev_latent_for_concat = None
+        if long_video_mode == "LATENT_CONTINUE":
+            has_prev = prev_latent is not None and prev_latent.get("samples") is not None
+            if has_prev and continue_frames_count > 0 and start_image is None:
+                latent_continue_mode = True
+                prev_samples = prev_latent["samples"]
+                if prev_samples.shape[2] > 0:
+                    last_frame = prev_samples[:, :, -1:].clone()
+                    lH, lW = latent.shape[-2], latent.shape[-1]
+                    if last_frame.shape[-2] != lH or last_frame.shape[-1] != lW:
+                        last_frame = torch.nn.functional.interpolate(
+                            last_frame.squeeze(2), size=(lH, lW), mode="bilinear", align_corners=False
+                        ).unsqueeze(2)
+                    for b in range(batch_size):
+                        latent[b:b+1, :, 0:1] = last_frame
+                    mask_high_noise[:, :, :4] = 0.0
+                    mask_low_noise[:, :, :4]  = 0.0
+                    prev_latent_for_concat = last_frame
+
+        # --- SVI ---
+        if long_video_mode == "SVI":
+            total_latents    = latent_t
+            H                = height // spacial_scale
+            W                = width  // spacial_scale
+            middle_latent_idx = middle_idx // 4
+            end_latent_idx   = total_latents - 1
+            has_prev = prev_latent is not None and prev_latent.get("samples") is not None
+
+            def _build_svi_conditioning(anchor_latent, motion_lat=None):
+                image_cond = torch.zeros(1, latent_channels, total_latents, H, W,
+                                         dtype=anchor_latent.dtype, device=anchor_latent.device)
+                image_cond = comfy.latent_formats.Wan21().process_out(image_cond)
+                if enable_start_frame:
+                    image_cond[:, :, :1] = anchor_latent
+                if motion_lat is not None:
+                    m_end = min(1 + motion_lat.shape[2], total_latents)
+                    image_cond[:, :, 1:m_end] = motion_lat[:, :, :m_end - 1]
+                if middle_image is not None and enable_middle_frame:
+                    ml = vae.encode(middle_image[:1, :, :, :3])
+                    if middle_latent_idx < total_latents:
+                        image_cond[:, :, middle_latent_idx:middle_latent_idx + 1] = ml
+                if end_image is not None and enable_end_frame:
+                    el = vae.encode(end_image[:1, :, :, :3])
+                    image_cond[:, :, end_latent_idx:end_latent_idx + 1] = el
+
+                mask_h = torch.ones((1, 4, total_latents, H, W), dtype=anchor_latent.dtype, device=device)
+                mask_l = torch.ones((1, 4, total_latents, H, W), dtype=anchor_latent.dtype, device=device)
+                if enable_start_frame:
+                    mask_h[:, :, :1] = max(0.0, 1.0 - high_noise_start_strength)
+                    mask_l[:, :, :1] = max(0.0, 1.0 - low_noise_start_strength)
+                if middle_image is not None and enable_middle_frame:
+                    sr = max(0, middle_latent_idx)
+                    er = min(total_latents, middle_latent_idx + 1)
+                    mask_h[:, :, sr:er] = max(0.0, 1.0 - high_noise_mid_strength)
+                    mask_l[:, :, sr:er] = max(0.0, 1.0 - low_noise_mid_strength)
+                if end_image is not None and enable_end_frame:
+                    mask_h[:, :, end_latent_idx:end_latent_idx + 1] = 0.0
+                    mask_l[:, :, end_latent_idx:end_latent_idx + 1] = max(0.0, 1.0 - low_noise_end_strength)
+                return image_cond, mask_h, mask_l
+
+            if has_prev and continue_frames_count > 0:
+                svi_continue_mode = True
+                if start_image is not None:
+                    anchor = vae.encode(start_image[:1, :, :, :3])
+                else:
+                    anchor = torch.zeros([1, latent_channels, 1, H, W], device=device, dtype=latent.dtype)
+                prev_samples = prev_latent["samples"]
+                n_motion = min(prev_samples.shape[2], ((continue_frames_count - 1) // 4) + 1)
+                motion_lat = prev_samples[:, :, -n_motion:].clone()
+                if svi_motion_strength != 1.0:
+                    motion_lat = motion_lat * svi_motion_strength
+                image_cond, mask_h, mask_l = _build_svi_conditioning(anchor, motion_lat)
+            elif start_image is not None:
+                anchor = vae.encode(start_image[:1, :, :, :3])
+                image_cond, mask_h, mask_l = _build_svi_conditioning(anchor)
+            else:
+                image_cond = comfy.latent_formats.Wan21().process_out(
+                    torch.zeros(1, latent_channels, total_latents, H, W, device=device, dtype=latent.dtype)
+                )
+                mask_h = torch.ones((1, 4, total_latents, H, W), device=device, dtype=latent.dtype)
+                mask_l = torch.ones((1, 4, total_latents, H, W), device=device, dtype=latent.dtype)
+
+            pos_high = node_helpers.conditioning_set_values(positive, {"concat_latent_image": image_cond, "concat_mask": mask_h})
+            pos_low  = node_helpers.conditioning_set_values(positive, {"concat_latent_image": image_cond, "concat_mask": mask_l})
+            neg_out  = node_helpers.conditioning_set_values(negative, {"concat_latent_image": image_cond, "concat_mask": mask_h})
+
+            clip_vision_output = merge_clip_vision_outputs(
+                clip_vision_start_image  if enable_start_frame  else None,
+                clip_vision_middle_image if enable_middle_frame else None,
+                clip_vision_end_image    if enable_end_frame    else None,
+            )
+            if clip_vision_output is not None:
+                pos_low = node_helpers.conditioning_set_values(pos_low, {"clip_vision_output": clip_vision_output})
+                neg_out = node_helpers.conditioning_set_values(neg_out, {"clip_vision_output": clip_vision_output})
+
+            return io.NodeOutput(pos_high, pos_low, neg_out, {"samples": latent})
+
+        # --- AUTO_CONTINUE / DISABLED / LATENT_CONTINUE (pixel-space path) ---
+        if has_motion_frames and long_video_mode not in ("SVI", "LATENT_CONTINUE"):
+            image[:motion_frames.shape[0]] = motion_frames[:, :, :, :3]
+            motion_latent_frames = ((motion_frames.shape[0] - 1) // 4) + 1
+            mask_high_noise[:, :, :motion_latent_frames * 4] = 0.0
+            if not svi_continue_mode:
+                mask_low_noise[:, :, :motion_latent_frames * 4] = 0.0
+            if middle_image is not None and enable_middle_frame:
+                image[middle_idx:middle_idx + 1] = middle_image
+                sr, er = max(0, middle_idx), min(length, middle_idx + 4)
+                mask_high_noise[:, :, sr:er] = max(0.0, 1.0 - high_noise_mid_strength)
+                mask_low_noise[:, :, sr:er]  = max(0.0, 1.0 - low_noise_mid_strength)
+            if end_image is not None and enable_end_frame:
+                image[-1:] = end_image[:, :, :, :3]
+                mask_high_noise[:, :, -1:] = 0.0
+                mask_low_noise[:, :, -1:]  = max(0.0, 1.0 - low_noise_end_strength)
+        else:
+            if start_image is not None and long_video_mode != "LATENT_CONTINUE" and enable_start_frame:
+                image[:start_image.shape[0]] = start_image[:, :, :, :3]
+                if is_pure_triple_mode:
+                    mask_range = min(start_image.shape[0] + 3, length)
+                    mask_high_noise[:, :, :mask_range] = max(0.0, 1.0 - high_noise_start_strength)
+                    mask_low_noise[:, :, :mask_range]  = max(0.0, 1.0 - low_noise_start_strength)
+                else:
+                    slf = ((start_image.shape[0] - 1) // 4) + 1
+                    mask_high_noise[:, :, :slf * 4] = max(0.0, 1.0 - high_noise_start_strength)
+                    mask_low_noise[:, :, :slf * 4]  = max(0.0, 1.0 - low_noise_start_strength)
+            if middle_image is not None and enable_middle_frame:
+                image[middle_idx:middle_idx + 1] = middle_image
+                sr, er = max(0, middle_idx), min(length, middle_idx + 4)
+                mask_high_noise[:, :, sr:er] = max(0.0, 1.0 - high_noise_mid_strength)
+                mask_low_noise[:, :, sr:er]  = max(0.0, 1.0 - low_noise_mid_strength)
+            if end_image is not None and enable_end_frame:
+                image[-end_image.shape[0]:] = end_image[:, :, :, :3]
+                if is_pure_triple_mode:
+                    mask_high_noise[:, :, -end_image.shape[0]:] = 0.0
+                    mask_low_noise[:, :, -end_image.shape[0]:]  = max(0.0, 1.0 - low_noise_end_strength)
+                else:
+                    mask_high_noise[:, :, -1:] = 0.0
+                    mask_low_noise[:, :, -1:]  = max(0.0, 1.0 - low_noise_end_strength)
+
+        if latent_continue_mode and prev_latent_for_concat is not None:
+            concat_latent_image = vae.encode(image[:, :, :, :3])
+            concat_latent_image[:, :, 0:1] = prev_latent_for_concat
+        else:
+            concat_latent_image = vae.encode(image[:, :, :, :3])
+
+        if structural_repulsion_boost > 1.001 and length > 4:
+            mask_h2, mask_w2 = mask_high_noise.shape[-2], mask_high_noise.shape[-1]
+            boost_factor = structural_repulsion_boost - 1.0
+
+            if start_image is not None and middle_image is not None and enable_middle_frame:
+                g1 = create_spatial_gradient(start_image[0:1].to(device), middle_image[0:1].to(device), mask_h2, mask_w2, boost_factor)
+                if g1 is not None:
+                    s_end = start_image.shape[0] + 3
+                    t_end = min(max(s_end, middle_idx - 4), length)
+                    for fi in range(s_end, t_end):
+                        mask_high_noise[:, :, fi] = mask_high_noise[:, :, fi] * g1
+
+            if middle_image is not None and end_image is not None and enable_middle_frame:
+                g2 = create_spatial_gradient(middle_image[0:1].to(device), end_image[-1:].to(device), mask_h2, mask_w2, boost_factor)
+                if g2 is not None:
+                    for fi in range(middle_idx + 5, length - end_image.shape[0]):
+                        mask_high_noise[:, :, fi] = mask_high_noise[:, :, fi] * g2
+
+            if start_image is not None and end_image is not None and (middle_image is None or not enable_middle_frame):
+                g3 = create_spatial_gradient(start_image[0:1].to(device), end_image[-1:].to(device), mask_h2, mask_w2, boost_factor)
+                if g3 is not None:
+                    for fi in range(start_image.shape[0] + 3, length - end_image.shape[0]):
+                        mask_high_noise[:, :, fi] = mask_high_noise[:, :, fi] * g3
+
+        if latent_continue_mode:
+            concat_latent_image_low = concat_latent_image
+        elif mode == "SINGLE_PERSON":
+            image_low = torch.ones((length, height, width, 3), device=device) * 0.5
+            if motion_frames is not None:
+                image_low[:motion_frames.shape[0]] = motion_frames[:, :, :, :3]
+            elif start_image is not None:
+                image_low[:start_image.shape[0]] = start_image[:, :, :, :3]
+            concat_latent_image_low = vae.encode(image_low[:, :, :, :3])
+        elif low_noise_start_strength == 0.0 or low_noise_mid_strength == 0.0 or low_noise_end_strength == 0.0:
+            image_low = torch.ones((length, height, width, 3), device=device) * 0.5
+            if motion_frames is not None and low_noise_start_strength > 0.0:
+                image_low[:motion_frames.shape[0]] = motion_frames[:, :, :, :3]
+            elif start_image is not None and low_noise_start_strength > 0.0 and enable_start_frame:
+                image_low[:start_image.shape[0]] = start_image[:, :, :, :3]
+            if middle_image is not None and low_noise_mid_strength > 0.0 and enable_middle_frame:
+                image_low[middle_idx:middle_idx + 1] = middle_image
+            if end_image is not None and low_noise_end_strength > 0.0 and enable_end_frame:
+                if is_pure_triple_mode:
+                    image_low[-end_image.shape[0]:] = end_image[:, :, :, :3]
+                else:
+                    image_low[-1:] = end_image[:, :, :, :3]
+            concat_latent_image_low = vae.encode(image_low[:, :, :, :3])
+        else:
+            concat_latent_image_low = concat_latent_image
+
+        mask_high_reshaped = mask_high_noise.view(
+            1, mask_high_noise.shape[2] // 4, 4, mask_high_noise.shape[3], mask_high_noise.shape[4]
+        ).transpose(1, 2)
+        mask_low_reshaped = mask_low_noise.view(
+            1, mask_low_noise.shape[2] // 4, 4, mask_low_noise.shape[3], mask_low_noise.shape[4]
+        ).transpose(1, 2)
+
+        pos_high = node_helpers.conditioning_set_values(positive, {"concat_latent_image": concat_latent_image,     "concat_mask": mask_high_reshaped})
+        pos_low  = node_helpers.conditioning_set_values(positive, {"concat_latent_image": concat_latent_image_low, "concat_mask": mask_low_reshaped})
+        neg_out  = node_helpers.conditioning_set_values(negative, {"concat_latent_image": concat_latent_image,     "concat_mask": mask_high_reshaped})
+
+        clip_vision_output = merge_clip_vision_outputs(
+            clip_vision_start_image  if enable_start_frame  else None,
+            clip_vision_middle_image if enable_middle_frame else None,
+            clip_vision_end_image    if enable_end_frame    else None,
         )
-        positive_high, positive_low, negative_out, latent = result.result[:4]
-        return io.NodeOutput(positive_high, positive_low, negative_out, latent)
+        if clip_vision_output is not None:
+            pos_low = node_helpers.conditioning_set_values(pos_low, {"clip_vision_output": clip_vision_output})
+            neg_out = node_helpers.conditioning_set_values(neg_out, {"clip_vision_output": clip_vision_output})
+
+        return io.NodeOutput(pos_high, pos_low, neg_out, {"samples": latent})
