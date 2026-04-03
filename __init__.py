@@ -47,6 +47,18 @@ try:
 except ImportError:
     print("wan_svi_pro_advanced.py not found")
 
+HAS_MODULAR = False
+try:
+    from .wan_i2v_modular import (
+        WanI2VBase,
+        WanStrengthOptions,
+        WanContinuationOptions,
+        WanClipVisionOptions,
+    )
+    HAS_MODULAR = True
+except ImportError:
+    print("wan_i2v_modular.py not found")
+
 
 class WanVideoExtension(ComfyExtension):
     @override
@@ -69,7 +81,15 @@ class WanVideoExtension(ComfyExtension):
         
         if HAS_SVI_PRO_ADVANCED:
             nodes.append(WanSVIProAdvancedI2V)
-        
+
+        if HAS_MODULAR:
+            nodes.extend([
+                WanI2VBase,
+                WanStrengthOptions,
+                WanContinuationOptions,
+                WanClipVisionOptions,
+            ])
+
         return nodes
 
 
