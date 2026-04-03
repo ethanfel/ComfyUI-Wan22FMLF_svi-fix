@@ -192,13 +192,22 @@ class WanAdvancedI2V(io.ComfyNode):
                 prev_samples = prev_latent["samples"]
                 
                 if prev_samples.shape[2] > 0:
+                    last_frame = prev_samples[:, :, -1:].clone()
+
+                    # Resize spatially if prev_latent was generated at a different resolution
+                    lH, lW = latent.shape[-2], latent.shape[-1]
+                    if last_frame.shape[-2] != lH or last_frame.shape[-1] != lW:
+                        last_frame = torch.nn.functional.interpolate(
+                            last_frame.squeeze(2), size=(lH, lW), mode='bilinear', align_corners=False
+                        ).unsqueeze(2)
+
                     for b in range(batch_size):
-                        latent[b:b+1, :, 0:1, :, :] = prev_samples[:, :, -1:].clone()
-                    
+                        latent[b:b+1, :, 0:1, :, :] = last_frame
+
                     mask_high_noise[:, :, :4] = 0.0
                     mask_low_noise[:, :, :4] = 0.0
-                    
-                    prev_latent_for_concat = prev_samples[:, :, -1:].clone()
+
+                    prev_latent_for_concat = last_frame
         # --- End of Latent Continue Mode Logic ---
 
         # --- SVI Mode Logic ---
@@ -528,18 +537,7 @@ class WanAdvancedI2V(io.ComfyNode):
                         current_mask = mask_high_noise[:, :, frame_idx, :, :]
                         mask_high_noise[:, :, frame_idx, :, :] = current_mask * spatial_gradient
         
-        if svi_continue_mode:
-            # Second pass: motion_frames is injected into latent first frame
-            # start_image used for low noise conditioning as concat image
-            image_low = torch.ones((length, height, width, 3), device=device) * 0.5
-            
-            if start_image is not None:
-                image_low[:start_image.shape[0]] = start_image[:, :, :, :3]
-                start_latent_frames = ((start_image.shape[0] - 1) // 4) + 1
-                mask_low_noise[:, :, :start_latent_frames * 4] = 0.0
-            
-            concat_latent_image_low = vae.encode(image_low[:, :, :, :3])
-        elif latent_continue_mode:
+        if latent_continue_mode:
             # LATENT_CONTINUE mode: concat image and concat latent should be the same
             # Use the same image for both high and low noise conditioning
             concat_latent_image_low = concat_latent_image

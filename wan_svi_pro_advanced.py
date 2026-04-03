@@ -206,6 +206,14 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
                 use_frames = adjusted_frames
 
             motion_latent = prev_samples[:, :, -use_frames:].clone()
+
+            # Resize spatially if prev_latent was generated at a different resolution
+            if motion_latent.shape[-2] != H or motion_latent.shape[-1] != W:
+                B_m, C_m, T_m = motion_latent.shape[:3]
+                flat = motion_latent.reshape(B_m * C_m * T_m, 1, motion_latent.shape[-2], motion_latent.shape[-1])
+                flat = torch.nn.functional.interpolate(flat, size=(H, W), mode='bilinear', align_corners=False)
+                motion_latent = flat.reshape(B_m, C_m, T_m, H, W)
+
             motion_start = 1 if enable_start_frame else 0
             motion_end = min(motion_start + use_frames, total_latents)
 
