@@ -436,6 +436,20 @@ class WanI2VBase(io.ComfyNode):
                 mask_h = torch.ones((1, 4, total_latents, H, W), device=device, dtype=latent.dtype)
                 mask_l = torch.ones((1, 4, total_latents, H, W), device=device, dtype=latent.dtype)
 
+            if structural_repulsion_boost > 1.001 and total_latents > 1:
+                svi_ref = []
+                if has_prev and continue_frames_count > 0:
+                    n_motion_used = min(prev_latent["samples"].shape[2], ((continue_frames_count - 1) // 4) + 1)
+                    svi_ref.append(min(1 + n_motion_used, total_latents - 1))
+                elif enable_start_frame and start_image is not None:
+                    svi_ref.append(0)
+                if middle_image is not None and enable_middle_frame and middle_latent_idx < total_latents:
+                    svi_ref.append(middle_latent_idx)
+                if end_image is not None and enable_end_frame:
+                    svi_ref.append(end_latent_idx)
+                if len(svi_ref) >= 2:
+                    image_cond = apply_repulsion_boost(image_cond, svi_ref, structural_repulsion_boost)
+
             pos_high = node_helpers.conditioning_set_values(positive, {"concat_latent_image": image_cond, "concat_mask": mask_h})
             pos_low  = node_helpers.conditioning_set_values(positive, {"concat_latent_image": image_cond, "concat_mask": mask_l})
             neg_out  = node_helpers.conditioning_set_values(negative, {"concat_latent_image": image_cond, "concat_mask": mask_h})

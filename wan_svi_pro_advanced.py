@@ -308,7 +308,11 @@ class WanSVIProAdvancedI2V(io.ComfyNode):
         # --- Structural repulsion boost ---
         if structural_repulsion_boost > 1.001 and total_latents > 1:
             ref_indices = []
-            if enable_start_frame and start_image is not None:
+            has_motion = motion_latent is not None and motion_end > motion_start
+            if has_motion:
+                # Start after motion frames to avoid corrupting prev_latent data
+                ref_indices.append(min(motion_end, total_latents - 1))
+            elif enable_start_frame and start_image is not None:
                 ref_indices.append(0)
             if img_mid is not None and enable_middle_frame and actual_middle_idx < total_latents:
                 ref_indices.append(actual_middle_idx)
