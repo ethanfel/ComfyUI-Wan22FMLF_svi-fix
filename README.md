@@ -10,6 +10,8 @@ Built on top of [wallen0322/ComfyUI-Wan22FMLF](https://github.com/wallen0322/Com
 
 https://github.com/user-attachments/assets/dc1cf2a4-3c6a-4210-a247-e53c2423f776
 
+https://github.com/user-attachments/assets/2f4a5b17-610f-4c5c-9e3f-e5fd5083e762
+
 Two 161-frame segments + one 81-frame segment. Each segment's variation is controlled by a middle frame and prompt. Lip sync applied uniformly at the end.
 
 > This workflow combines: SVI Pro Advanced + First-Middle-Last + VBVR physics LoRA + InfiniTalk lip sync (Painter AV2V). The workflow file is in `example_workflows/`.
